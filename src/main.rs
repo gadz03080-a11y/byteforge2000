@@ -7,16 +7,39 @@ use eframe::{
     App,
 };
 use libloading::{Library, Symbol};
+use serde_json::json;
 use std::{
     ffi::{c_char, c_int, CStr},
     fs,
+    net::TcpStream,
     path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::Duration,
 };
 
 const APP_TITLE: &str = "ByteForge 2000";
 const PLUGIN_DIR: &str = "plugins";
 const HEX_ROW_LEN: usize = 16;
 const MAX_HEX_ROWS: usize = 4096; // защита от зависания на огромных файлах
+const HF_MODEL_ID: &str = "byteforge2000/mini-binary-classifier";
+const HF_MODEL_CARD: &str = "Small Hugging Face-style local classifier for binary/file-type hints, entropy-aware heuristics, and analyst guidance.";
+const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+const OLLAMA_MODEL: &str = "llama3.2:3b";
+const SYSTEM_PROMPT: &str = "You are ByteForge 2000 Tiny AI Assistant. Keep answers short, practical, and evidence-based. Use entropy, signature hits, printable ratio, and audio structure as clues.";
+const CHAT_SYSTEM_PROMPT: &str = "You are ByteForge 2000 Chat Assistant. Answer as a practical binary-analysis helper. Use the current file context, available signals, and explicit skills to guide the user. Keep replies concise but useful.";
+const AI_SKILLS: &[&str] = &[
+    "Skill 1: detect text-like files with high printable ratio.",
+    "Skill 2: recognize likely compressed, encrypted, or binary-heavy content from entropy and embedded signatures.",
+    "Skill 3: infer audio-like streams from WAV/PCM structure or heuristic byte-energy scans.",
+    "Skill 4: suggest the next best action for the analyst.",
+];
+const CHAT_SKILLS: &[&str] = &[
+    "Skill 1: explain the current file in plain language using evidence from entropy, signatures, and preview stats.",
+    "Skill 2: answer questions about likely file type, suspicious content, and what to inspect next.",
+    "Skill 3: recommend plugins, heuristics, and inspection steps for binary or audio-heavy files.",
+    "Skill 4: provide short, actionable guidance for analysts and developers.",
+];
 
 #[repr(C)]
 struct CPluginInfo {
@@ -558,7 +581,227 @@ fn ai_verdict(entropy: f32, printable_ratio: f32) -> &'static str {
     }
 }
 
+fn tiny_local_classifier(
+    entropy: f32,
+    printable_ratio: f32,
+    signature_count: usize,
+    audio_tracks: usize,
+) -> (String, f32, String) {
+    let entropy_score = (entropy / 8.0).clamp(0.0, 1.0);
+    let printable_score = printable_ratio.clamp(0.0, 1.0);
+    let signature_score = (signature_count as f32 / 6.0).clamp(0.0, 1.0);
+    let audio_score = (audio_tracks as f32 / 5.0).clamp(0.0, 1.0);
 
+    let score = (0.38 * entropy_score
+        + 0.26 * (1.0 - printable_score)
+        + 0.24 * signature_score
+        + 0.12 * audio_score)
+        .clamp(0.0, 1.0);
+
+    if printable_score > 0.82 {
+        (
+            "text-like content".to_string(),
+            (score * 100.0).round(),
+            "Review the file as text or serialized data; verify line endings and encoding.".to_string(),
+        )
+    } else if entropy > 7.0 {
+        (
+            "compressed or encrypted candidate".to_string(),
+            (score * 100.0).round(),
+            "Inspect for compression headers, packed blobs, or XOR-like obfuscation.".to_string(),
+        )
+    } else if audio_tracks > 0 {
+        (
+            "audio-like stream".to_string(),
+            (score * 100.0).round(),
+            "Check lane boundaries and export meaningful segments for further inspection.".to_string(),
+        )
+    } else if signature_count > 0 {
+        (
+            "structured binary / container".to_string(),
+            (score * 100.0).round(),
+            "Open the embedded chunk boundaries and run plugin-based checks on the matched format.".to_string(),
+        )
+    } else {
+        (
+            "mixed / uncertain".to_string(),
+            (score * 100.0).round(),
+            "Collect more evidence from plugins, signatures, or a larger byte window.".to_string(),
+        )
+    }
+}
+
+fn build_model_info() -> String {
+    format!("Model: {HF_MODEL_ID}\nType: lightweight Hugging Face-style local classifier\nStatus: available offline\nCard: {HF_MODEL_CARD}")
+}
+
+fn build_chat_context_summary(file_name: &str, file_size: usize, entropy: f32, printable_ratio: f32, suspicious_count: usize, signatures: &[String], audio_tracks: usize) -> String {
+    let signature_count = signatures
+        .iter()
+        .filter(|sig| !sig.starts_with("No known signatures found"))
+        .count();
+
+    format!(
+        "File: {file_name}\nSize: {file_size} bytes\nPrintable ratio: {:.2}%\nSuspicious bytes: {suspicious_count}\nEntropy: {:.3}\nSignature hits: {signature_count}\nAudio lanes: {audio_tracks}\nDetected signatures:\n{}",
+        printable_ratio * 100.0,
+        entropy,
+        if signature_count == 0 {
+            "No known signatures found".to_string()
+        } else {
+            signatures.join("\n")
+        }
+    )
+}
+
+fn ask_ollama_chat(user_message: &str, context: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::new();
+    let payload = json!({
+        "model": OLLAMA_MODEL,
+        "stream": false,
+        "messages": [
+            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": format!(
+                    "Use the following analysis context and answer the user's question.\n\nContext:\n{}\n\nUser question:\n{}",
+                    context, user_message
+                )
+            }
+        ]
+    });
+
+    let response = client
+        .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+        .json(&payload)
+        .send()
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = response.json().ok()?;
+    let content = body
+        .get("message")?
+        .get("content")?
+        .as_str()?
+        .trim()
+        .to_string();
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+fn generate_chat_reply(user_message: &str, context: &str) -> String {
+    let query = user_message.trim();
+    if query.is_empty() {
+        return "Ask me about the file, plugins, audio tracks, or the next best inspection step.".to_string();
+    }
+
+    if let Some(answer) = ask_ollama_chat(query, context) {
+        return answer;
+    }
+
+    let lower = query.to_ascii_lowercase();
+    let context_lines = context.lines().collect::<Vec<_>>();
+    let model_info = build_model_info();
+    let likely_text = context_lines
+        .iter()
+        .find(|line| line.to_ascii_lowercase().contains("printable ratio"))
+        .map(|line| *line)
+        .unwrap_or("");
+
+    let mut reply = format!(
+        "System prompt:\n{CHAT_SYSTEM_PROMPT}\n\nModel info:\n{model_info}\n\nSkills:\n{}\n\nContext:\n{context}\n\nAnswer:\n",
+        CHAT_SKILLS.join("\n")
+    );
+
+    if lower.contains("what is this file") || lower.contains("what kind") || lower.contains("file type") {
+        if likely_text.contains("Printable ratio") {
+            let printable_ratio = context_lines
+                .iter()
+                .find(|line| line.to_ascii_lowercase().contains("printable ratio"))
+                .and_then(|line| line.split(':').nth(1))
+                .map(str::trim)
+                .unwrap_or("0");
+
+            let ratio = printable_ratio.parse::<f32>().unwrap_or(0.0);
+            let type_hint = if ratio > 80.0 {
+                "This looks text-like or serialized data rather than raw binary."
+            } else {
+                "This looks more like structured binary or a container format."
+            };
+            reply.push_str(type_hint);
+        } else {
+            reply.push_str("From the current context, this looks like a binary or mixed-content file. I would start with signature hits, entropy, and preview stats.");
+        }
+    } else if lower.contains("plugin") {
+        reply.push_str("I would inspect the plugin library next, verify each plugin status, and run only the relevant plugin against the current offset or file contents.");
+    } else if lower.contains("audio") || lower.contains("track") {
+        reply.push_str("The audio evidence suggests looking at lane boundaries, peak amplitude, silence gaps, and exported segments. If the file is WAV or PCM, inspect track types first.");
+    } else if lower.contains("safe") || lower.contains("suspicious") || lower.contains("encrypted") {
+        reply.push_str("The strongest clues are entropy, suspicious byte count, and signature hits. If entropy is high and signatures are weak, treat it as a likely compressed or encrypted candidate until proven otherwise.");
+    } else if lower.contains("next") || lower.contains("what should i do") || lower.contains("how to inspect") {
+        reply.push_str("Start with the strongest evidence: signatures, printable ratio, entropy, and then audio lanes or plugin output. Use the findings to narrow the file family before deep manual decoding.");
+    } else {
+        reply.push_str("My best current read is that the file is being classified from the available structural signals. I would verify the strongest matching signatures first, then the entropy and printable ratio, and finally use plugins or audio segmentation if applicable.");
+    }
+
+    reply
+}
+
+fn tiny_ai_response(
+    file_name: &str,
+    file_size: usize,
+    entropy: f32,
+    printable_ratio: f32,
+    suspicious_count: usize,
+    signatures: &[String],
+    audio_tracks: usize,
+) -> String {
+    let signature_count = signatures
+        .iter()
+        .filter(|sig| !sig.starts_with("No known signatures found"))
+        .count();
+
+    let (label, confidence, next_step) = tiny_local_classifier(
+        entropy,
+        printable_ratio,
+        signature_count,
+        audio_tracks,
+    );
+
+    let signature_block = if signature_count == 0 {
+        "No known signatures found".to_string()
+    } else {
+        signatures.join("\n")
+    };
+
+    let recommendation = match label.as_str() {
+        "text-like content" => {
+            "1. Verify encoding and line endings.\n2. Inspect for embedded metadata, JSON, XML, or serialized payloads.\n3. Run a plugin scan if the file is expected to be structured binary."
+        }
+        "compressed or encrypted candidate" => {
+            "1. Check for common headers such as ZIP, GZIP, PNG, or PE.\n2. Examine entropy spikes and byte sparsity.\n3. Try a plugin or a known decompression path before deep manual decoding."
+        }
+        "audio-like stream" => {
+            "1. Review lane boundaries and segment types.\n2. Export the strongest tracks for separate inspection.\n3. Compare waveform amplitude and silence regions for anomalies."
+        }
+        "structured binary / container" => {
+            "1. Open the matching embedded container boundaries.\n2. Inspect the first few chunks and plugin outputs.\n3. Cross-check the found signatures with the file map."
+        }
+        _ => {
+            "1. Gather more evidence from signatures and plugins.\n2. Re-run the scan with a larger byte window if available.\n3. Compare against known file families before drawing conclusions."
+        }
+    };
+
+    format!(
+        "Assessment:\n- class: {label}\n- confidence: {confidence:.0}%\n- next step: {next_step}\n\nRecommended actions:\n{recommendation}\n\nDetected signatures:\n{signature_block}",
+    )
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -569,6 +812,7 @@ enum Tab {
     Console,
     Analysis,
     Library,
+    Chat,
 }
 
 struct ByteForge2000App {
@@ -594,6 +838,8 @@ struct ByteForge2000App {
     audio_tracks: Vec<AudioTrack>,
     audio_info: String,
     selected_track: usize,
+    chat_messages: Vec<String>,
+    chat_input: String,
 
     plugins: Vec<LoadedPlugin>,
     plugin_run_output: String,
@@ -629,6 +875,10 @@ impl Default for ByteForge2000App {
             ai_summary: "Open a file, then press AI ANALYSIS.".to_string(),
             audio_tracks: Vec::new(),
             audio_info: "No file loaded".to_string(),
+            chat_messages: vec![
+                "ByteForge AI: Hello! Ask me about this file, plugins, audio lanes, or what to inspect next.".to_string(),
+            ],
+            chat_input: String::new(),
             selected_track: 0,
             plugins: Vec::new(),
             plugin_run_output: String::new(),
@@ -822,8 +1072,18 @@ impl ByteForge2000App {
 
     fn refresh_ai_summary(&mut self) {
         let verdict = ai_verdict(self.entropy, self.printable_ratio);
+        let assistant = tiny_ai_response(
+            &self.file_name,
+            self.file_size,
+            self.entropy,
+            self.printable_ratio,
+            self.suspicious_count,
+            &self.signatures,
+            self.audio_tracks.len(),
+        );
+
         self.ai_summary = format!(
-            "File size: {} bytes\nPrintable ratio: {:.2}%\nSuspicious bytes: {}\nShannon entropy: {:.3} bits/byte\nAudio lanes: {}\n\nSignatures:\n{}\n\nVerdict: {}",
+            "File size: {} bytes\nPrintable ratio: {:.2}%\nSuspicious bytes: {}\nShannon entropy: {:.3} bits/byte\nAudio lanes: {}\n\nSignatures:\n{}\n\nVerdict: {}\n\nTiny local AI assistant:\n{}",
             self.file_size,
             self.printable_ratio * 100.0,
             self.suspicious_count,
@@ -831,8 +1091,22 @@ impl ByteForge2000App {
             self.audio_tracks.len(),
             self.signatures.join("\n"),
             verdict,
+            assistant,
         );
-        self.log(format!("[AI] entropy={:.3} verdict={}", self.entropy, verdict));
+
+        let (_, confidence, _) = tiny_local_classifier(
+            self.entropy,
+            self.printable_ratio,
+            self.signatures
+                .iter()
+                .filter(|sig| !sig.starts_with("No known signatures found"))
+                .count(),
+            self.audio_tracks.len(),
+        );
+        self.log(format!(
+            "[AI] entropy={:.3} verdict={} confidence={:.0}%",
+            self.entropy, verdict, confidence
+        ));
     }
 
     fn build_hex_lines(bytes: &[u8]) -> Vec<String> {
@@ -952,6 +1226,7 @@ impl App for ByteForge2000App {
                     ribbon_tab(ui, &mut self.tab, Tab::Console, "CONSOLE");
                     ribbon_tab(ui, &mut self.tab, Tab::Analysis, "ANALYSIS");
                     ribbon_tab(ui, &mut self.tab, Tab::Library, "LIBRARY");
+                    ribbon_tab(ui, &mut self.tab, Tab::Chat, "CHAT");
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(14.0);
@@ -1072,6 +1347,7 @@ impl App for ByteForge2000App {
                         Tab::Console => self.draw_console_tab(ui),
                         Tab::Analysis => self.draw_analysis_tab(ui),
                         Tab::Library => self.draw_library_tab(ui),
+                        Tab::Chat => self.draw_chat_tab(ui),
                     }
                 });
             });
@@ -1328,6 +1604,54 @@ impl ByteForge2000App {
         });
     }
 
+    fn draw_chat_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("CHAT ASSISTANT").strong());
+        ui.add_space(6.0);
+
+        let context = build_chat_context_summary(
+            &self.file_name,
+            self.file_size,
+            self.entropy,
+            self.printable_ratio,
+            self.suspicious_count,
+            &self.signatures,
+            self.audio_tracks.len(),
+        );
+
+        let mut send_clicked = false;
+
+        ui.vertical(|ui| {
+            ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                for message in &self.chat_messages {
+                    ui.label(RichText::new(message).size(12.0));
+                    ui.add_space(4.0);
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(ui.available_width() - 90.0, 28.0),
+                    TextEdit::singleline(&mut self.chat_input).hint_text("Ask about file, audio, plugins..."),
+                );
+                if ui.button("Send").clicked() {
+                    send_clicked = true;
+                }
+            });
+        });
+
+        if send_clicked {
+            let user_message = self.chat_input.trim().to_string();
+            if !user_message.is_empty() {
+                self.chat_messages.push(format!("You: {user_message}"));
+                let reply = generate_chat_reply(&user_message, &context);
+                self.chat_messages.push(reply);
+                self.chat_input.clear();
+                self.status = "Chat assistant replied".to_string();
+            }
+        }
+    }
+
     fn draw_library_tab(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("PLUGIN LIBRARY").strong());
         ui.add_space(6.0);
@@ -1561,7 +1885,41 @@ fn apply_dark_ribbon_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+fn is_ollama_server_ready() -> bool {
+    TcpStream::connect("127.0.0.1:11434").is_ok()
+}
+
+fn start_ollama_server_if_needed() {
+    if is_ollama_server_ready() {
+        return;
+    }
+
+    let local_appdata = match std::env::var("LOCALAPPDATA") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    let ollama_path = PathBuf::from(local_appdata)
+        .join("Programs")
+        .join("Ollama")
+        .join("ollama.exe");
+
+    if !ollama_path.exists() {
+        return;
+    }
+
+    let _ = Command::new(ollama_path).arg("serve").spawn();
+
+    for _ in 0..50 {
+        if is_ollama_server_ready() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn main() {
+    start_ollama_server_if_needed();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 720.0]),
         ..Default::default()
