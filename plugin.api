@@ -1,0 +1,75 @@
+/*
+ * ByteForge 2000 — публичный ABI для плагинов на C/C++.
+ *
+ * Плагин компилируется в shared library:
+ *   Windows: .dll   (cl /LD plugin.c /Fe:plugin.dll)
+ *   Linux:   .so    (gcc -shared -fPIC plugin.c -o plugin.so)
+ *   macOS:   .dylib (clang -shared -fPIC plugin.c -o plugin.dylib)
+ *
+ * Обязательные экспортируемые символы:
+ *   const PluginInfo* plugin_get_info(void);
+ *   int                plugin_process(const PluginRequest* request, PluginResult* result);
+ *
+ * Хост (Rust/egui) гарантирует:
+ *   - указатели входных данных валидны только на время вызова plugin_process;
+ *   - плагин не должен хранить указатели после возврата из функции;
+ *   - строки — NUL-terminated UTF-8.
+ */
+
+#ifndef BYTEFORGE_PLUGIN_API_H
+#define BYTEFORGE_PLUGIN_API_H
+
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum PluginType {
+    PLUGIN_TYPE_ANALYZER = 0,
+    PLUGIN_TYPE_TRANSFORMER = 1,
+    PLUGIN_TYPE_AUDIO_PROCESSOR = 2,
+    PLUGIN_TYPE_VISUALIZATION = 3,
+    PLUGIN_TYPE_REPAIR = 4
+} PluginType;
+
+/* Статическое описание плагина, отображается в LIBRARY. */
+typedef struct PluginInfo {
+    const char *name;         /* имя плагина                         */
+    const char *description;  /* краткое описание того, что он делает */
+    PluginType  type;         /* тип плагина                         */
+    const char *version;      /* строка версии, например "1.0.0"     */
+} PluginInfo;
+
+/* Что хост передаёт плагину при вызове AI ANALYSIS / RUN PLUGIN. */
+typedef struct PluginRequest {
+    const unsigned char *data;   /* байты текущего открытого файла */
+    size_t                length; /* длина data в байтах             */
+    size_t                offset_hint; /* текущий OFFSET из UI, если задан */
+} PluginRequest;
+
+/* Что плагин возвращает хосту. Буферы выделяет и владеет ХОСТ,
+ * плагин только заполняет их и возвращает фактически записанную длину. */
+typedef struct PluginResult {
+    unsigned char *out_data;      /* буфер для изменённых байт (может быть NULL) */
+    size_t          out_capacity;  /* вместимость out_data                        */
+    size_t          out_written;   /* сколько байт плагин реально записал         */
+
+    char   *log_buffer;    /* буфер для текстового результата анализа */
+    size_t  log_capacity;  /* вместимость log_buffer                  */
+} PluginResult;
+
+/* Возвращает статическое описание плагина. Никогда не должно
+ * возвращать NULL — хост покажет "LOAD ERROR", если это произойдёт. */
+const PluginInfo *plugin_get_info(void);
+
+/* Основная точка входа. Возвращает 0 при успехе, !=0 при ошибке.
+ * Реализация обязана записать человекочитаемый результат в
+ * result->log_buffer (ограничившись result->log_capacity байт). */
+int plugin_process(const PluginRequest *request, PluginResult *result);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* BYTEFORGE_PLUGIN_API_H */

@@ -1,0 +1,21 @@
+[package]
+name = "byteforge2000"
+version = "0.2.0"
+edition = "2021"
+description = "ByteForge 2000 — desktop HEX/audio/AI binary analyzer with C/C++ plugin support"
+license = "Apache-2.0"
+
+[[bin]]
+name = "byteforge2000"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+rfd = "0.14"
+libloading = "0.8"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+
+[profile.release]
+opt-level = 3
+lto = true

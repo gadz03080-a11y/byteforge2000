@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+venv/
+.env
+
+
+# Added by cargo
+
+/target
