@@ -62,6 +62,6 @@ int plugin_process(const PluginRequest *request, PluginResult *result) {
         entropy > 7.5 ? "likely compressed/encrypted" : "likely structured data"
     );
 
-    result->out_written = 0; /* этот плагин не изменяет байты файла */
+    result->out_written = 0;
     return 0;
 }
